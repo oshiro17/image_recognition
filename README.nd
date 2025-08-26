@@ -1,0 +1,23 @@
+# 📷 定期撮影差分 PoC
+
+このプロジェクトはカメラを定期的にキャプチャして直前の画像と比較し、差分を可視化するツールです。  
+[Streamlit](https://streamlit.io/) を使って、ブラウザから操作できます。
+
+---
+
+## 🚀 実行方法（まとめてコピー可）
+
+```bash
+# 仮想環境の作成と有効化 (mac/Linux)
+python3 -m venv .venv
+source .venv/bin/activate
+
+# 仮想環境の作成と有効化 (Windows PowerShell)
+python -m venv .venv
+.venv\Scripts\activate
+
+# 必要ライブラリのインストール
+pip install streamlit opencv-python numpy
+
+# アプリ起動
+python -m streamlit run app.py
