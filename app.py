@@ -128,7 +128,7 @@ if run:
             st.code(str(cam_diag))
         else:
             # 表示用
-            ph_curr.image(bgr2rgb(curr), caption="今の写真", use_container_width=True)
+            ph_curr.image(bgr2rgb(curr), caption="今の写真", use_column_width=True)
             st.caption(f"Camera: index={cam_index}, backend={cam_diag.get('backend_used')} shape={cam_diag.get('shape')}")
 
             if ss["prev_img"] is not None:
@@ -165,20 +165,20 @@ if run:
                 clusters_vis = draw_clusters_only(imgA, clusters, color=(0,0,255), thickness=6, show_count=True)
 
                 # 3) 画面表示
-                ph_prev.image(bgr2rgb(imgA), caption="1分前の写真", use_container_width=True)
+                ph_prev.image(bgr2rgb(imgA), caption="1分前の写真", use_column_width=True)
 
                 st.subheader("差分結果")
                 c1, c2 = st.columns(2)
                 with c1:
-                    st.image(bgr2rgb(vis_boxes), caption="赤枠（差分矩形）", use_container_width=True)
+                    st.image(bgr2rgb(vis_boxes), caption="赤枠（差分矩形）", use_column_width=True)
                 with c2:
-                    st.image(th_mask, clamp=True, caption="差分マスク（二値）", use_container_width=True)
+                    st.image(th_mask, clamp=True, caption="差分マスク（二値）", use_column_width=True)
 
                 c3, c4 = st.columns(2)
                 with c3:
-                    st.image(bgr2rgb(overlay), caption="半透明合成", use_container_width=True)
+                    st.image(bgr2rgb(overlay), caption="半透明合成", use_column_width=True)
                 with c4:
-                    st.image(bgr2rgb(clusters_vis), caption="密集クラスタ（大枠）", use_container_width=True)
+                    st.image(bgr2rgb(clusters_vis), caption="密集クラスタ（大枠）", use_column_width=True)
 
                 aligned_txt = aligned_method if aligned_method else "なし"
                 placeholder_info.info(
