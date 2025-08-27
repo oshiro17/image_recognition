@@ -26,6 +26,39 @@ def census8(img):
             bit = (bit + 1) % 8
     return out
 
+# --- 追加: 重なり領域内だけでSSIMを計算するユーティリティ ---
+
+def ssim_on_overlap(a, b, mask):
+    """
+    2枚 a,b の重なり領域(mask>0)内だけでSSIMを計算して返す。
+    skimage が無い場合は None を返す。
+    """
+    try:
+        from skimage.metrics import structural_similarity as _ssim
+    except Exception:
+        return None
+
+    if a is None or b is None or mask is None:
+        return None
+    if a.shape[:2] != b.shape[:2] or a.shape[:2] != mask.shape[:2]:
+        return None
+
+    gA = cv2.cvtColor(a, cv2.COLOR_BGR2GRAY)
+    gB = cv2.cvtColor(b, cv2.COLOR_BGR2GRAY)
+    m = (mask > 0)
+
+    # 面積が小さすぎると不安定なので防御
+    if m.sum() < 1000:
+        return None
+
+    gA_ = gA.copy(); gB_ = gB.copy()
+    gA_[~m] = 0
+    gB_[~m] = 0
+    try:
+        return float(_ssim(gA_, gB_))
+    except Exception:
+        return None
+
 def fused_diff_mask(a, b):
     """勾配+センサスの差分を融合→適応二値化→モルフォ処理。
        照明差に比較的強い差分マスクを返す（uint8, 0/255）。"""
