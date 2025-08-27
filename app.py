@@ -16,11 +16,11 @@ except Exception:  # ModuleNotFoundError 等
         return None
     _AUTOREFRESH_IMPL = "js"
 
-from make_ref import (
-    ensure_same_size, camera_misaligned, difference_boxes, fused_diff_mask, boxes_from_mask,
-    make_boxes_overlay_transparent, cluster_dense_boxes, draw_clusters_only,
-    align_ecc, align_homography
-)
+from core.io_utils import ensure_same_size
+from core.align import camera_misaligned, align_ecc, align_homography
+from core.diff import difference_boxes, fused_diff_mask, boxes_from_mask
+from core.vis import make_boxes_overlay_transparent, draw_clusters_only
+from core.cluster import cluster_dense_boxes
 
 st.set_page_config(page_title="定期撮影差分（1分ごと）", layout="wide")
 st.title("📷 定期撮影差分 PoC（1分ごとに前回と比較）")
@@ -128,7 +128,7 @@ if run:
             st.code(str(cam_diag))
         else:
             # 表示用
-            ph_curr.image(bgr2rgb(curr), caption="今の写真", use_column_width=True)
+            ph_curr.image(bgr2rgb(curr), caption="今の写真", use_container_width=True)
             st.caption(f"Camera: index={cam_index}, backend={cam_diag.get('backend_used')} shape={cam_diag.get('shape')}")
 
             if ss["prev_img"] is not None:
@@ -138,17 +138,20 @@ if run:
                 misaligned, diag = camera_misaligned(imgA, imgB, shift_px_thresh=shift_px_thresh, homography_checks=True)
                 aligned_method = None
                 if misaligned:
-                    b_ecc = align_ecc(imgA, imgB)
+                    b_ecc, _warp = align_ecc(imgA, imgB)
                     if b_ecc is not None:
-                        imgB = b_ecc; aligned_method = "ECC"
+                        imgB = b_ecc
+                        aligned_method = "ECC"
                     else:
-                        b_h = align_homography(imgA, imgB)
+                        b_h, _H = align_homography(imgA, imgB)
                         if b_h is not None:
-                            imgB = b_h; aligned_method = "H"
+                            imgB = b_h
+                            aligned_method = "H"
                         else:
                             placeholder_info.warning("自動整列に失敗したため、今回の差分はスキップしました。")
                             # 前回画像は更新して終了
-                            ss["prev_img"] = curr; ss["prev_ts"] = now
+                            ss["prev_img"] = curr
+                            ss["prev_ts"] = now
                             st.stop()
 
                 # 2) 差分抽出（厳密一致ならabsdiff、そうでなければ照明に強いマスク）
@@ -165,20 +168,20 @@ if run:
                 clusters_vis = draw_clusters_only(imgA, clusters, color=(0,0,255), thickness=6, show_count=True)
 
                 # 3) 画面表示
-                ph_prev.image(bgr2rgb(imgA), caption="1分前の写真", use_column_width=True)
+                ph_prev.image(bgr2rgb(imgA), caption="1分前の写真", use_container_width=True)
 
                 st.subheader("差分結果")
                 c1, c2 = st.columns(2)
                 with c1:
-                    st.image(bgr2rgb(vis_boxes), caption="赤枠（差分矩形）", use_column_width=True)
+                    st.image(bgr2rgb(vis_boxes), caption="赤枠（差分矩形）", use_container_width=True)
                 with c2:
-                    st.image(th_mask, clamp=True, caption="差分マスク（二値）", use_column_width=True)
+                    st.image(th_mask, clamp=True, caption="差分マスク（二値）", use_container_width=True)
 
                 c3, c4 = st.columns(2)
                 with c3:
-                    st.image(bgr2rgb(overlay), caption="半透明合成", use_column_width=True)
+                    st.image(bgr2rgb(overlay), caption="半透明合成", use_container_width=True)
                 with c4:
-                    st.image(bgr2rgb(clusters_vis), caption="密集クラスタ（大枠）", use_column_width=True)
+                    st.image(bgr2rgb(clusters_vis), caption="密集クラスタ（大枠）", use_container_width=True)
 
                 aligned_txt = aligned_method if aligned_method else "なし"
                 placeholder_info.info(

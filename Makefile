@@ -2,17 +2,21 @@
 PYTHON ?= .venv/bin/python
 PIP    ?= .venv/bin/pip
 SCRIPT ?= make_ref.py
+STREAMLIT ?= .venv/bin/streamlit
+APP       ?= app.py
+HOST      ?= 127.0.0.1
+PORT      ?= 8501
 
 OUTDIR := results          # make_ref.py の出力先
 ARTIFACT := artifacts      # ケースごとの成果物保存先
 
 # A:B 形式で列挙（コロンで区切る）
 PAIRS := \
-  closedoor.png:opendoor.png \
-  closedoor.png:closedoor_different_colors.png \
-  easy.png:easy_wrong.png
+  test_images/closedoor.png:test_images/opendoor.png \
+  test_images/closedoor.png:test_images/closedoor_different_colors.png \
+  test_images/easy.png:test_images/easy_wrong.png
 
-.PHONY: help venv deps clean clean-artifacts clean-results test-all run test1 test2
+.PHONY: help venv deps clean clean-artifacts clean-results test-all run test1 test2 app app-dev app-open streamlit-cache-clear
 
 help:
 	@echo "make deps            # 依存インストール"
@@ -25,7 +29,7 @@ venv:
 
 deps: venv
 	$(PIP) install --upgrade pip
-	$(PIP) install opencv-python scikit-image numpy
+	$(PIP) install opencv-python scikit-image numpy streamlit streamlit-autorefresh
 
 # 任意ペアを一回実行: 例) make run A=test1a.png B=test1b.png
 run: venv
@@ -56,14 +60,39 @@ test-all: venv
 
 # お好みでショートカット
 test1:
-	$(MAKE) run A=closedoor.png B=opendoor.png
+	$(MAKE) run A=test_images/closedoor.png B=test_images/opendoor.png
 test2:
-	$(MAKE) run A=closedoor.png B=closedoor_different_colors.png
+	$(MAKE) run A=test_images/closedoor.png B=test_images/closedoor_different_colors.png
 test3:
-	$(MAKE) run A=easy.png B=easy_wrong.png
+	$(MAKE) run A=test_images/easy.png B=test_images/easy_wrong.png
+test4:
+	echo "拡大画像"
+	$(MAKE) run A=test_images/IMG_4726.PNG B=test_images/IMG_4728.PNG
+test5:
+	echo "拡大画像逆ver"
+	$(MAKE) run A=test_images/IMG_4728.PNG B=test_images/IMG_4726.PNG
 
 clean-results:
 	@rm -rf "$(OUTDIR)"
 clean-artifacts:
 	@rm -rf "$(ARTIFACT)"
 clean: clean-results clean-artifacts
+
+# ---- Streamlit GUI targets ----
+app: venv deps
+	$(STREAMLIT) run $(APP) \
+	  --server.address=$(HOST) \
+	  --server.port=$(PORT)
+
+app-dev: venv deps
+	BROWSER=none $(STREAMLIT) run $(APP) \
+	  --server.address=$(HOST) \
+	  --server.port=$(PORT)
+
+app-open:
+	@which open >/dev/null 2>&1 && open "http://$(HOST):$(PORT)" || true
+
+streamlit-cache-clear:
+	@echo "Clearing Streamlit cache..."
+	@rm -rf ~/.cache/streamlit
+	@echo "Done."
