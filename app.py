@@ -1,11 +1,12 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-📷 基準撮影 → 設定 → 監視 の3ステップUI
+📷 基準撮影 → 設定 → 監視 の3ステップUI + YOLO物体検出
 - 起動直後は「基準を撮影/読み込み」のみ表示
 - 基準確定後に設定（撮影間隔・整列など）
 - スタートでループ（基準 vs 現在）差分をリアルタイム表示
 - すべての撮影＆差分は runs/<session>/ に保存、履歴ギャラリーで見返し＆ZIP DL
+- YOLO: 基準時に検出した物体一覧を保存。監視中に「新規出現/消失」を検知して通知
 """
 
 import os
@@ -20,7 +21,7 @@ import streamlit as st
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Dict, Any, Optional, List
 
 # --- Optional: click-to-pick (fallback to sliders if unavailable)
 try:
@@ -43,45 +44,35 @@ except Exception:
 # ---- 既存 core モジュール ----
 from core.io_utils import ensure_same_size
 from core.align import camera_misaligned, align_ecc, align_homography
-# from core.diff import difference_boxes, fused_diff_mask, boxes_from_mask, quality_harmonize_pair
 from core.vis import make_boxes_overlay_transparent, draw_clusters_only
 from core.cluster import cluster_dense_boxes
-
 from core.diff import difference_boxes, fused_diff_mask, boxes_from_mask
-
 from core.quality import quality_harmonize_pair
+
+# ---- YOLO ----
+#   pip install ultralytics
+#   別ファイル core/yolo.py に detect_objects / draw_detections を実装済みの想定
+from core.yolo import detect_objects, draw_detections
 
 # ============ 色ターゲット監視（Labベース） ヘルパ ============
 
 def _lab(img: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
 
-
-
 def draw_target_preview(img: np.ndarray, x: int, y: int, r: int) -> np.ndarray:
-    """Draw a circle and small crosshair at (x,y)."""
     vis = img.copy()
     x = int(x); y = int(y); r = int(r)
     cv2.circle(vis, (x, y), r, (0, 255, 255), 2)
     cv2.drawMarker(vis, (x, y), (0, 255, 255), markerType=cv2.MARKER_CROSS, markerSize=10, thickness=2)
     return vis
 
-
-# --- Optional clickable image helper
 def clickable_pick_xy(img_rgb: np.ndarray, key: str = "clickpick") -> tuple[int | None, int | None]:
-    """
-    Show an image; if st-click-detector is available, return clicked (x,y) in image coordinates.
-    Otherwise, return (None, None) and the caller should fallback to sliders.
-    """
     if not _HAS_CLICK:
         st.image(img_rgb, use_container_width=True)
         return None, None
     h, w = img_rgb.shape[:2]
-    # Render clickable image
-    events = _click_detector(img_rgb, key=key)  # returns dict with keys like 'x', 'y' in CSS pixels
-    # st-click-detector returns proportional coordinates as 'x','y' in the shown image space (0..displayW/H).
+    events = _click_detector(img_rgb, key=key)
     if events and "x" in events and "y" in events and events["x"] is not None and events["y"] is not None:
-        # Map from displayed size back to original by keeping ratios
         disp_w = events.get("display_width", w) or w
         disp_h = events.get("display_height", h) or h
         rx = float(events["x"]) / float(max(1, disp_w))
@@ -91,55 +82,35 @@ def clickable_pick_xy(img_rgb: np.ndarray, key: str = "clickpick") -> tuple[int 
         return x, y
     return None, None
 
-
 def sample_lab_stats(img: np.ndarray, x: int, y: int, r: int, use_l: bool = False) -> dict:
-    """基準画像から (x,y) 周辺半径 r の Lab 統計量（平均/分散）を取得。
-    デフォルトでは a,b のみを使い、use_l=True なら L も併用できる。
-    戻り値: {mean: (L,a,b), std: (L,a,b)}
-    """
     h, w = img.shape[:2]
     x = int(np.clip(x, 0, w - 1)); y = int(np.clip(y, 0, h - 1)); r = int(max(1, r))
     lab = _lab(img)
     yy, xx = np.ogrid[:h, :w]
     mask = (xx - x) ** 2 + (yy - y) ** 2 <= r ** 2
     if mask.sum() < 5:
-        # 最低限の画素数が無ければ周囲に拡張
         r = max(3, r + 2)
         mask = (xx - x) ** 2 + (yy - y) ** 2 <= r ** 2
     vals = lab[mask]
     mean = vals.mean(axis=0)
     std = vals.std(axis=0) + 1e-6
-    return {
-        "mean": (float(mean[0]), float(mean[1]), float(mean[2])),
-        "std": (float(std[0]), float(std[1]), float(std[2])),
-        "use_l": bool(use_l)
-    }
-
+    return {"mean": (float(mean[0]), float(mean[1]), float(mean[2])),
+            "std": (float(std[0]), float(std[1]), float(std[2])), "use_l": bool(use_l)}
 
 def _target_mask_for_img(img: np.ndarray, target: dict, roi: Optional[tuple] = None) -> np.ndarray:
-    """現在画像に対して、target(Lab ガウス近傍)に属する画素マスクを返す（uint8）。
-    roi=(x,y,w,h) があればその範囲内で評価。
-    既定では a,b のみの楕円距離、target["use_l"] が真なら L も含める。
-    target 例:
-      {"name": str, "mean": (L,a,b), "std": (L,a,b), "k_sigma": 2.5, "use_l": False, "roi": (x,y,w,h)}
-    """
     lab = _lab(img)
     h, w = lab.shape[:2]
     if roi is not None:
         x, y, rw, rh = [int(v) for v in roi]
         x = max(0, x); y = max(0, y); rw = max(1, rw); rh = max(1, rh)
         x2 = min(w, x + rw); y2 = min(h, y + rh)
-        sub = lab[y:y2, x:x2]
-        off = (x, y)
+        sub = lab[y:y2, x:x2]; off = (x, y)
     else:
-        sub = lab
-        off = (0, 0)
-
+        sub = lab; off = (0, 0)
     meanL, meana, meanb = target.get("mean", (0, 0, 0))
     stdL, stda, stdb = target.get("std", (1, 1, 1))
     k = float(target.get("k_sigma", 2.5))
     use_l = bool(target.get("use_l", False))
-
     L = sub[..., 0]; A = sub[..., 1]; B = sub[..., 2]
     da = (A - meana) / (stda + 1e-6)
     db = (B - meanb) / (stdb + 1e-6)
@@ -152,9 +123,7 @@ def _target_mask_for_img(img: np.ndarray, target: dict, roi: Optional[tuple] = N
     out[off[1]:off[1] + mask.shape[0], off[0]:off[0] + mask.shape[1]] = mask
     return out
 
-
 def ratio_for_target(img: np.ndarray, target: dict) -> float:
-    """画像 img における target 画素の割合（0..1）を返す。"""
     roi = target.get("roi")
     m = _target_mask_for_img(img, target, roi)
     if roi is not None:
@@ -164,21 +133,16 @@ def ratio_for_target(img: np.ndarray, target: dict) -> float:
     else:
         return float((m > 0).sum()) / float(m.size)
 
-
-# --- 色ターゲット追加/確認UI（基準が存在する前提）
 def render_color_target_editor():
-    """色ターゲットの追加/確認UI（基準が存在する前提）。ss.targets を直接更新する。"""
     if not ss.get("baseline_path"):
-        st.info("基準画像が未設定です。")
-        return
+        st.info("基準画像が未設定です。"); return
     base = cv2.imread(ss.baseline_path, cv2.IMREAD_COLOR)
     if base is None:
-        st.warning("基準画像の読み込みに失敗しました。")
-        return
+        st.warning("基準画像の読み込みに失敗しました。"); return
     h, w = base.shape[:2]
     cols = st.columns([2,1])
     with cols[0]:
-        st.caption("基準画像上で色ターゲットを指定します。クリック対応（st-click-detector）が無い場合はスライダーを使用してください。")
+        st.caption("基準画像上で色ターゲットを指定します。クリック非対応ならスライダーを使用。")
         img_rgb = bgr2rgb(base)
         cx, cy = clickable_pick_xy(img_rgb, key="pick_target_xy_cfg")
         default_x = w//2 if cx is None else cx
@@ -204,31 +168,20 @@ def render_color_target_editor():
             roi = (rx, ry, rw, rh)
         if st.button("＋ この色をターゲットに追加", type="primary", use_container_width=True, key="t_add"):
             stats = sample_lab_stats(base, x, y, r, use_l=use_l)
-            tmp_target = {
-                "name": name,
-                "mean": stats["mean"],
-                "std": stats["std"],
-                "use_l": use_l,
-                "k_sigma": float(k_sigma),
-                "direction": direction,
-                "threshold_pct": float(threshold_pct),
-                "roi": roi,
-            }
+            tmp_target = {"name": name, "mean": stats["mean"], "std": stats["std"], "use_l": use_l,
+                          "k_sigma": float(k_sigma), "direction": direction, "threshold_pct": float(threshold_pct), "roi": roi}
             base_ratio = ratio_for_target(base, tmp_target)
             tmp_target["base_ratio"] = float(base_ratio)
             ss.targets.append(tmp_target)
             st.success(f"追加しました: {name} (基準割合 {base_ratio*100:.2f}%)")
         show_mask_preview = st.checkbox("この設定でマスクをプレビュー", value=False, key="t_preview")
         if show_mask_preview:
-            tmp = {
-                "name": name, "k_sigma": float(k_sigma), "use_l": use_l,
-                "mean": sample_lab_stats(base, x, y, r, use_l)["mean"],
-                "std": sample_lab_stats(base, x, y, r, use_l)["std"],
-                "roi": roi
-            }
+            tmp = {"name": name, "k_sigma": float(k_sigma), "use_l": use_l,
+                   "mean": sample_lab_stats(base, x, y, r, use_l)["mean"],
+                   "std": sample_lab_stats(base, x, y, r, use_l)["std"],
+                   "roi": roi}
             pm = _target_mask_for_img(base, tmp, roi)
             st.image(pm, clamp=True, caption="ターゲットマスク（基準画像）", use_container_width=True)
-    # 追加済み一覧
     if ss.targets:
         st.markdown("#### 追加済みターゲット")
         del_idxs = []
@@ -242,8 +195,6 @@ def render_color_target_editor():
                 del_idxs.append(i)
         for i in reversed(del_idxs):
             ss.targets.pop(i)
-
-
 
 # ============ 共通UI ============
 
@@ -281,15 +232,21 @@ def _init_state():
     ss.setdefault("last_metrics", None)     # 直近メトリクス
     ss.setdefault("backend", "AVFOUNDATION" if sys.platform == "darwin" else "AUTO")
     ss.setdefault("cam_index", 0)
-    ss.setdefault("targets", [])  # 監視する色ターゲットのリスト
+    ss.setdefault("targets", [])
+    # YOLO関連
+    ss.setdefault("baseline_yolo", [])      # [{"label","conf","bbox"}]
+    ss.setdefault("yolo_conf", 0.5)
+    ss.setdefault("yolo_watch_person", True)
+    ss.setdefault("yolo_alert_new", True)
+    ss.setdefault("yolo_alert_missing", True)
+    ss.setdefault("last_target_results", [])
 
 _init_state()
 
 # ============ ラン（保存先） ============
 
 def new_session_dir() -> str:
-    root = Path("runs")
-    root.mkdir(exist_ok=True)
+    root = Path("runs"); root.mkdir(exist_ok=True)
     name = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     session = root / name
     (session / "captures").mkdir(parents=True, exist_ok=True)
@@ -312,8 +269,7 @@ def append_index(session_dir: str, row: Dict[str, Any]) -> None:
 def make_zip(session_dir: str) -> str:
     base = Path(session_dir).resolve()
     out = base.parent / (base.name + ".zip")
-    if out.exists():
-        out.unlink()
+    if out.exists(): out.unlink()
     shutil.make_archive(str(out.with_suffix("")), "zip", root_dir=str(base))
     return str(out)
 
@@ -347,13 +303,120 @@ def capture_frame(index: int, backend: str, warmup: int = 5, size: Tuple[int,int
 def bgr2rgb(img: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
+# ======= Beep/Alert Helpers =======
+def _play_beep(duration_ms: int = 500, freq_hz: int = 880):
+    st.components.v1.html(f"""
+    <script>
+      (function(){{
+        try {{
+          const AC = window.AudioContext || window.webkitAudioContext;
+          const ctx = new AC();
+          const o = ctx.createOscillator();
+          const g = ctx.createGain();
+          o.type = "sine";
+          o.frequency.value = {freq_hz};
+          o.connect(g); g.connect(ctx.destination);
+          g.gain.setValueAtTime(0.001, ctx.currentTime);
+          g.gain.exponentialRampToValueAtTime(0.3, ctx.currentTime + 0.02);
+          o.start();
+          g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + {duration_ms}/1000.0);
+          o.stop(ctx.currentTime + {duration_ms}/1000.0 + 0.05);
+        }} catch(e) {{ console.log("beep error", e); }}
+      }})();
+    </script>
+    """, height=0)
+
+def _alert_banner(msg: str):
+    st.markdown(
+        "<div style='padding:12px 16px;border-radius:10px;border:2px solid #ffb3b3;background:#fff1f1;color:#b00020;font-weight:700;font-size:20px;'>"
+        f"🚨 {msg}"
+        "</div>",
+        unsafe_allow_html=True
+    )
+    _play_beep(380, 920); _play_beep(380, 720)
+
 # 画像読込ヘルパー
 def imread_color(path: str) -> Optional[np.ndarray]:
-    if not path:
-        return None
+    if not path: return None
     img = cv2.imread(path, cv2.IMREAD_COLOR)
     return img if isinstance(img, np.ndarray) and img.size > 0 else None
 
+# ============ YOLO 比較ユーティリティ ============
+
+def _iou_xywh(a: tuple, b: tuple) -> float:
+    ax, ay, aw, ah = a; bx, by, bw, bh = b
+    ax2, ay2 = ax+aw, ay+ah; bx2, by2 = bx+bw, by+bh
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2-ix1), max(0, iy2-iy1)
+    inter = iw*ih
+    union = aw*ah + bw*bh - inter
+    return float(inter) / float(max(1, union))
+
+def analyze_yolo_changes(baseline_det: List[Dict[str,Any]], current_det: List[Dict[str,Any]], iou_thr: float=0.3):
+    """
+    基準と現在のYOLO検出を突き合わせて
+    - new_labels: 基準に無いラベルが現れた
+    - missing_labels: 基準にあったラベルが消えた
+    - person_appeared: 基準にperson無し→現在person有り
+
+    入力の dict 形式に差があっても耐えるよう、以下のキーに対応：
+      ラベル: "label" | "name" | "class_name" | "cls_name" | "cls" | "class"
+      BBox :  "bbox"(xywh) | "xywh" | "xyxy" | {"x","y","w","h"}
+    """
+    def _label_of(d: Dict[str,Any]) -> Optional[str]:
+        for k in ("label","name","class_name","cls_name","cls","class"):
+            if k in d and d[k] is not None:
+                return str(d[k])
+        return None
+
+    def _bbox_of(d: Dict[str,Any]) -> Optional[tuple]:
+        if "bbox" in d and d["bbox"] is not None:
+            x, y, w, h = d["bbox"]
+            return (float(x), float(y), float(w), float(h))
+        if "xywh" in d and d["xywh"] is not None:
+            x, y, w, h = d["xywh"]
+            return (float(x), float(y), float(w), float(h))
+        if "xyxy" in d and d["xyxy"] is not None:
+            x1, y1, x2, y2 = d["xyxy"]
+            w = max(0.0, float(x2) - float(x1))
+            h = max(0.0, float(y2) - float(y1))
+            return (float(x1), float(y1), w, h)
+        if isinstance(d.get("box"), dict):
+            bx = d["box"]
+            if all(k in bx for k in ("x","y","w","h")):
+                return (float(bx["x"]), float(bx["y"]), float(bx["w"]), float(bx["h"]))
+        return None
+
+    base_labels = [lb for lb in (_label_of(d) for d in baseline_det) if lb]
+    cur_labels  = [lb for lb in (_label_of(d) for d in current_det) if lb]
+
+    new_labels = sorted(list(set(cur_labels) - set(base_labels)))
+    missing_labels = sorted(list(set(base_labels) - set(cur_labels)))
+
+    def _matched(s: Dict[str,Any], t: Dict[str,Any]) -> bool:
+        slb, tlb = _label_of(s), _label_of(t)
+        if not slb or not tlb or slb != tlb:
+            return False
+        sbx, tbx = _bbox_of(s), _bbox_of(t)
+        if not sbx or not tbx:
+            return False
+        return _iou_xywh(sbx, tbx) >= iou_thr
+
+    missing_instances = [s for s in baseline_det if not any(_matched(s, t) for t in current_det)]
+    appeared_instances = [t for t in current_det if not any(_matched(s, t) for s in baseline_det)]
+
+    person_appeared = ("person" not in base_labels) and ("person" in cur_labels)
+    person_missing  = ("person" in base_labels) and ("person" not in cur_labels)
+
+    return {
+        "new_labels": new_labels,
+        "missing_labels": missing_labels,
+        "appeared_instances": appeared_instances,
+        "missing_instances": missing_instances,
+        "person_appeared": person_appeared,
+        "person_missing": person_missing
+    }
 # ============ 差分処理（基準 vs 現在） ============
 
 def compare_to_baseline(baseline_bgr: np.ndarray, current_bgr: np.ndarray, cfg: Dict[str,Any]) -> Dict[str,Any]:
@@ -379,8 +442,7 @@ def compare_to_baseline(baseline_bgr: np.ndarray, current_bgr: np.ndarray, cfg: 
 
     # 厳密一致ならabsdiff赤枠、そうでなければ照明に強いマスク
     vis_boxes, th_mask, boxes = None, None, []
-    strict_same = (aligned_method=="NONE")
-    if strict_same:
+    if aligned_method == "NONE":
         vis_boxes, th_mask, boxes = difference_boxes(a, b, min_wh=cfg.get("min_wh", 15), bin_thresh=None)
     else:
         th_mask = fused_diff_mask(a, b)
@@ -394,9 +456,9 @@ def compare_to_baseline(baseline_bgr: np.ndarray, current_bgr: np.ndarray, cfg: 
     # SSIM（マスクなし簡易）
     try:
         from skimage.metrics import structural_similarity as ssim
-        ss = ssim(cv2.cvtColor(a, cv2.COLOR_BGR2GRAY), cv2.cvtColor(b, cv2.COLOR_BGR2GRAY))
+        ss_val = ssim(cv2.cvtColor(a, cv2.COLOR_BGR2GRAY), cv2.cvtColor(b, cv2.COLOR_BGR2GRAY))
     except Exception:
-        ss = None
+        ss_val = None
 
     # 色ターゲット監視
     targets_cfg = cfg.get("targets", []) or []
@@ -405,13 +467,13 @@ def compare_to_baseline(baseline_bgr: np.ndarray, current_bgr: np.ndarray, cfg: 
         try:
             curr_ratio = ratio_for_target(b, t)
             base_ratio = float(t.get("base_ratio", 0.0))
-            direction = t.get("direction", "decrease")  # or "increase"
+            direction = t.get("direction", "decrease")
             thr = float(t.get("threshold_pct", 5.0)) / 100.0
             delta = curr_ratio - base_ratio
             if direction == "increase":
-                alert = (delta >= thr)
-            else:  # decrease
-                alert = (-delta >= thr)
+                alert = (delta >= thr); vanished = False
+            else:
+                alert = (-delta >= thr); vanished = (curr_ratio <= 0.001)
             target_results.append({
                 "name": t.get("name", "target"),
                 "curr_ratio": curr_ratio,
@@ -419,63 +481,51 @@ def compare_to_baseline(baseline_bgr: np.ndarray, current_bgr: np.ndarray, cfg: 
                 "delta": delta,
                 "direction": direction,
                 "threshold_pct": t.get("threshold_pct", 5.0),
-                "alert": bool(alert)
+                "alert": bool(alert),
+                "vanished": bool(vanished)
             })
         except Exception as e:
             target_results.append({"name": t.get("name","target"), "error": str(e)})
 
-    # Compose a color overlay for all targets (for live preview)
-    target_overlay = a.copy()
-    if targets_cfg:
-        accum = np.zeros(a.shape[:2], np.uint8)
-        color_map = [(0,255,255),(255,128,0),(0,200,0),(220,0,120),(120,0,220),(0,180,255)]
-        for i, t in enumerate(targets_cfg):
-            try:
-                m = _target_mask_for_img(b, t, t.get("roi"))
-                # keep a softer mask for visualization
-                col = color_map[i % len(color_map)]
-                mask3 = cv2.cvtColor(m, cv2.COLOR_GRAY2BGR)
-                tint = np.full_like(target_overlay, col, dtype=np.uint8)
-                target_overlay = np.where(mask3>0, cv2.addWeighted(target_overlay, 0.4, tint, 0.6, 0), target_overlay)
-                accum = cv2.bitwise_or(accum, m)
-            except Exception:
-                continue
+    # YOLO物体検出（現在フレーム）
+    yolo_conf = float(cfg.get("yolo_conf", ss.get("yolo_conf", 0.5)))
+    det_cur = detect_objects(b, conf=yolo_conf)
+    yolo_vis = draw_detections(b, det_cur)
+
+    # YOLO 差分（基準 vs 現在）
+    det_base = ss.get("baseline_yolo", [])
+    yolo_changes = analyze_yolo_changes(det_base, det_cur, iou_thr=0.3)
 
     return {
         "A": a, "B": b,
         "vis_boxes": vis_boxes, "mask": th_mask, "overlay": overlay, "clusters_vis": clusters_vis,
-        "boxes": boxes, "diff_ratio": diff_ratio, "ssim": ss,
+        "boxes": boxes, "diff_ratio": diff_ratio, "ssim": ss_val,
         "aligned": aligned_method,
-        "target_results": target_results,
-        "target_overlay": target_overlay
+        "target_results": target_results, "target_overlay": a.copy(),  # overlay of targets is optional; keep a for layout
+        "yolo_detections": det_cur, "yolo_vis": yolo_vis, "yolo_changes": yolo_changes
     }
 
 # ============ テスト実行ユーティリティ ============
 def run_test_case(pathA: str, pathB: str, cfg: Dict[str,Any], out_dir: Path) -> Dict[str,Any]:
-    a = imread_color(pathA)
-    b = imread_color(pathB)
+    a = imread_color(pathA); b = imread_color(pathB)
     if a is None or b is None:
         return {"ok": False, "error": f"読込失敗 A={pathA}, B={pathB}"}
     res = compare_to_baseline(a, b, cfg)
     out_dir.mkdir(parents=True, exist_ok=True)
-    # 保存
     cv2.imwrite(str(out_dir/"A_baseline.png"), a)
     cv2.imwrite(str(out_dir/"B_compare.png"), b)
     cv2.imwrite(str(out_dir/"diff_boxes.png"), res["vis_boxes"])
     cv2.imwrite(str(out_dir/"diff_mask.png"), res["mask"])
     cv2.imwrite(str(out_dir/"diff_boxesx2.png"), res["clusters_vis"])
-    # 要約
+    # YOLO可視化
+    if isinstance(res.get("yolo_vis"), np.ndarray):
+        cv2.imwrite(str(out_dir/"yolo_vis.png"), res["yolo_vis"])
     return {
-        "ok": True,
-        "A": pathA,
-        "B": pathB,
-        "aligned": res["aligned"],
-        "ssim": res["ssim"],
-        "diff_ratio": res["diff_ratio"],
-        "boxes": len(res["boxes"]),
+        "ok": True, "A": pathA, "B": pathB,
+        "aligned": res["aligned"], "ssim": res["ssim"],
+        "diff_ratio": res["diff_ratio"], "boxes": len(res["boxes"]),
         "dir": str(out_dir)
     }
-
 
 # ============ UI：ステップ 1（基準） ============
 
@@ -501,6 +551,16 @@ def ui_step_baseline():
                 ss.cam_index = idx
                 ss.backend = be
                 ss.cam_diag = diag
+                # --- YOLO: 基準検出を保存 ---
+                yolo_conf = float(ss.get("yolo_conf", 0.5))
+                det_base = detect_objects(frame, conf=yolo_conf)
+                ss.baseline_yolo = det_base
+                with open(Path(session)/"baseline_yolo.json","w",encoding="utf-8") as f:
+                    json.dump(det_base, f, ensure_ascii=False, indent=2)
+                # 可視化も保存
+                vis = draw_detections(frame, det_base)
+                cv2.imwrite(str(Path(session)/"baseline_yolo_vis.png"), vis)
+
                 ss.phase = "BASELINE_SET"
                 st.success("基準を保存しました！次へ進めます。")
                 st.rerun()
@@ -519,15 +579,30 @@ def ui_step_baseline():
                 cv2.imwrite(base_path, img)
                 ss.session_dir = session
                 ss.baseline_path = base_path
+                # YOLO基準
+                yolo_conf = float(ss.get("yolo_conf", 0.5))
+                det_base = detect_objects(img, conf=yolo_conf)
+                ss.baseline_yolo = det_base
+                with open(Path(session)/"baseline_yolo.json","w",encoding="utf-8") as f:
+                    json.dump(det_base, f, ensure_ascii=False, indent=2)
+                vis = draw_detections(img, det_base)
+                cv2.imwrite(str(Path(session)/"baseline_yolo_vis.png"), vis)
+
                 ss.phase = "BASELINE_SET"
                 st.success("基準を保存しました！次へ進めます。")
                 st.rerun()
 
-    # 基準ができたら色ターゲット追加UI
+    # 基準ができたら色ターゲット追加UI + YOLO基準表示
     if ss.get("baseline_path"):
         st.markdown("---")
         st.subheader("🎯 監視する色ターゲットを追加（任意）")
         render_color_target_editor()
+
+        with st.expander("🧠 基準のYOLO検出（参考）", expanded=False):
+            st.caption(f"しきい値 conf ≥ {ss.get('yolo_conf',0.5)}")
+            if Path(ss.session_dir, "baseline_yolo_vis.png").exists():
+                st.image(bgr2rgb(cv2.imread(str(Path(ss.session_dir, "baseline_yolo_vis.png")))), use_container_width=True)
+            st.json(ss.get("baseline_yolo", []))
 
 # ============ UI：ステップ 2（設定） ============
 
@@ -545,8 +620,19 @@ def ui_step_config():
         min_wh = st.slider("最小ボックス幅/高さ(px)", 5, 100, 15, 1)
 
         st.markdown("---")
+        st.markdown("**YOLO（物体監視）**")
+        yolo_conf = st.slider("YOLO信頼度しきい値", 0.1, 0.9, float(ss.get("yolo_conf",0.5)), 0.05)
+        watch_person = st.toggle("人の出現を監視（基準に居なかったのに現れたら通知）", value=bool(ss.get("yolo_watch_person", True)))
+        alert_new = st.toggle("基準にないラベルが現れたら通知", value=bool(ss.get("yolo_alert_new", True)))
+        alert_missing = st.toggle("基準にあったラベルが消えたら通知", value=bool(ss.get("yolo_alert_missing", True)))
+
+        st.markdown("---")
         submitted = st.form_submit_button("✅ 設定を保存して次へ", use_container_width=True)
         if submitted:
+            ss.yolo_conf = float(yolo_conf)
+            ss.yolo_watch_person = bool(watch_person)
+            ss.yolo_alert_new = bool(alert_new)
+            ss.yolo_alert_missing = bool(alert_missing)
             ss.config = {
                 "interval": int(interval),
                 "target_short": int(target_short),
@@ -554,11 +640,15 @@ def ui_step_config():
                 "shift_px_thresh": float(shift_thresh),
                 "min_wh": int(min_wh),
                 "camera": {"index": ss.cam_index, "backend": ss.backend},
-                "targets": ss.get("targets", [])
+                "targets": ss.get("targets", []),
+                # YOLO
+                "yolo_conf": float(yolo_conf),
+                "yolo_watch_person": bool(watch_person),
+                "yolo_alert_new": bool(alert_new),
+                "yolo_alert_missing": bool(alert_missing),
             }
             save_config(ss.session_dir, ss.config)
             ss.phase = "CONFIG_SET"
-            # 次回撮影時刻はスタート時にセットする（停止中にカウントダウンさせない）
             ss.next_shot_ts = 0.0
             st.success("設定を保存しました！")
             st.rerun()
@@ -574,16 +664,13 @@ def ui_step_run():
     colA, colB = st.columns([2,1])
 
     with colB:
-        # ステータス＆操作
         running = ss.get("phase") == "RUNNING"
         status_badge = f"<span class='big-badge {'ok-badge' if running else 'ng-badge'}'>{'🟢 監視中' if running else '🔴 停止中'}</span>"
         st.markdown(status_badge, unsafe_allow_html=True)
         st.write("")
-
         c1, c2 = st.columns(2)
         if c1.button("▶️ スタート", use_container_width=True):
             ss.phase = "RUNNING"
-            # スタート時に次回撮影時刻をセット
             ss.next_shot_ts = time.time() + ss.config["interval"]
             st.rerun()
         if c2.button("⏸ 停止", use_container_width=True):
@@ -591,7 +678,6 @@ def ui_step_run():
             st.rerun()
 
         st.markdown("---")
-        # カウントダウン
         if running and ss.get("next_shot_ts", 0) > 0:
             target_ms = int(ss.next_shot_ts * 1000)
             interval_s = int(ss.config.get("interval", 60))
@@ -612,135 +698,167 @@ def ui_step_run():
               const p = 100 * Math.min(1, Math.max(0, (interval - remain)/interval));
               document.getElementById('cd_bar').style.width = p + '%';
             }}
-            tick();
-            setInterval(tick, 250);
+            tick(); setInterval(tick, 250);
             </script>
             """, height=60)
         else:
             st.caption("停止中（カウントダウンなし）")
 
-        # ZIP DL
         if st.button("💾 このセッションをZIPでダウンロード", use_container_width=True):
             zpath = make_zip(ss.session_dir)
             with open(zpath, "rb") as f:
                 st.download_button("ZIPをダウンロード", f, file_name=Path(zpath).name, mime="application/zip", use_container_width=True)
 
         st.markdown("---")
-        st.caption("基準画像プレビュー")
+        st.caption("基準画像プレビュー / 基準YOLO")
         base = cv2.imread(ss.baseline_path, cv2.IMREAD_COLOR)
         if base is not None:
             st.image(bgr2rgb(base), use_container_width=True)
+        if Path(ss.session_dir, "baseline_yolo_vis.png").exists():
+            st.image(bgr2rgb(cv2.imread(str(Path(ss.session_dir, "baseline_yolo_vis.png")))), caption="基準YOLO", use_container_width=True)
 
     with colA:
-        # ライブ差分
         st.subheader("リアルタイム差分")
         ph_cols = st.columns(3)
         phA, phB, phD = ph_cols[0].empty(), ph_cols[1].empty(), ph_cols[2].empty()
         info = st.empty()
 
-        # RUNNING のときだけリフレッシュ（チラつき抑制）
         running = ss.get("phase") == "RUNNING"
         if running:
             st_autorefresh(interval=max(1000, int(ss.config.get("interval", 60) * 1000)), key="tick-live")
 
-        # 条件：RUNNINGなら時刻到達で撮影→差分→保存
         if ss.phase == "RUNNING" and time.time() >= ss.next_shot_ts:
-            # 撮影
             frame, diag = capture_frame(ss.config["camera"]["index"], ss.config["camera"]["backend"])
             if frame is not None:
-                # 差分
                 baseline = cv2.imread(ss.baseline_path, cv2.IMREAD_COLOR)
                 res = compare_to_baseline(baseline, frame, ss.config)
-                # 保存
+
                 tsname = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
                 cap_path = str(Path(ss.session_dir)/"captures"/f"{tsname}.jpg")
                 diff_path = str(Path(ss.session_dir)/"diffs"/f"{tsname}_diff.png")
                 diffx2_path = str(Path(ss.session_dir)/"diffs"/f"{tsname}_diffx2.png")
                 mask_path = str(Path(ss.session_dir)/"diffs"/f"{tsname}_mask.png")
+                yolo_path = str(Path(ss.session_dir)/"diffs"/f"{tsname}_yolo.png")
                 cv2.imwrite(cap_path, frame)
                 cv2.imwrite(diff_path, res["vis_boxes"])
                 cv2.imwrite(diffx2_path, res["clusters_vis"])
                 cv2.imwrite(mask_path, res["mask"])
+                if isinstance(res.get("yolo_vis"), np.ndarray):
+                    cv2.imwrite(yolo_path, res["yolo_vis"])
+
                 append_index(ss.session_dir, {
                     "ts": tsname, "capture": Path(cap_path).name,
                     "aligned": res["aligned"], "ssim": (res["ssim"] if res["ssim"] is not None else -1),
                     "diff_ratio": res["diff_ratio"], "boxes": len(res["boxes"])
                 })
-                # Save target overlay image if present
-                if isinstance(res.get("target_overlay"), np.ndarray):
-                    tov_path = str(Path(ss.session_dir)/"diffs"/f"{tsname}_targets.png")
-                    cv2.imwrite(tov_path, res["target_overlay"])
                 ss.last_metrics = {"ts": tsname, "aligned": res["aligned"], "ssim": res["ssim"], "diff_ratio": res["diff_ratio"], "boxes": len(res["boxes"])}
-            # 次回時刻
+                ss.last_target_results = res.get("target_results", [])
+
+                # ---- YOLOアラート ----
+                yc = res.get("yolo_changes", {})
+                msgs = []
+                if ss.config.get("yolo_watch_person", True) and yc.get("person_appeared"):
+                    msgs.append("人が現れました！")
+                if ss.config.get("yolo_alert_new", True) and yc.get("new_labels"):
+                    msgs.append("新しい物体: " + ", ".join(yc["new_labels"]))
+                if ss.config.get("yolo_alert_missing", True) and yc.get("missing_labels"):
+                    msgs.append("消えた物体: " + ", ".join(yc["missing_labels"]))
+                # ---- 色ターゲットのアラート ----
+                tr = res.get("target_results", []) or []
+                for t in tr:
+                    if t.get("alert"):
+                        direction_jp = "増加" if t.get("direction") == "increase" else "減少"
+                        msgs.append(
+                            f"色[{t.get('name','target')}] {direction_jp} "
+                            f"{abs(t.get('delta',0)*100):.1f}% "
+                            f"(基準 {t.get('base_ratio',0)*100:.1f}% → 現在 {t.get('curr_ratio',0)*100:.1f}%)"
+                        )
+                    if t.get("vanished"):
+                        msgs.append(f"色[{t.get('name','target')}] 完全に消失しました")
+                if msgs:
+                    _alert_banner(" / ".join(msgs))
+
             ss.next_shot_ts = time.time() + ss.config["interval"]
 
-        # 表示（直近の撮影結果 or 最新の保存済み）
+        # 表示（最新）
         baseline = cv2.imread(ss.baseline_path, cv2.IMREAD_COLOR)
         try:
             latest_list = sorted(glob.glob(str(Path(ss.session_dir)/"captures/*.jpg")))
             latest_cap = latest_list[-1] if latest_list else None
         except Exception:
             latest_cap = None
-        latest_diff = None
-        latest_diffx2 = None
-        latest_mask = None
+        latest_diff = latest_diffx2 = latest_mask = latest_yolo = None
         if latest_cap:
             tsname = Path(latest_cap).stem
             latest_diff = Path(ss.session_dir)/"diffs"/f"{tsname}_diff.png"
             latest_diffx2 = Path(ss.session_dir)/"diffs"/f"{tsname}_diffx2.png"
             latest_mask = Path(ss.session_dir)/"diffs"/f"{tsname}_mask.png"
+            latest_yolo = Path(ss.session_dir)/"diffs"/f"{tsname}_yolo.png"
 
         if latest_cap and baseline is not None:
             phA.image(bgr2rgb(baseline), caption="基準", use_container_width=True)
             imgB = cv2.imread(latest_cap, cv2.IMREAD_COLOR)
             phB.image(bgr2rgb(imgB), caption="今回ショット", use_container_width=True)
-            if latest_diff and latest_mask and latest_diff.exists() and latest_mask.exists():
-                grid = st.columns([2,2,1])
-                with grid[0]:
+            grid = st.columns([2,2,2])
+            with grid[0]:
+                if latest_diff and latest_diff.exists():
                     phD.image(bgr2rgb(cv2.imread(str(latest_diff))), caption="差分（赤枠・小）", use_container_width=True)
-                with grid[1]:
+            with grid[1]:
+                if latest_diffx2 and latest_diffx2.exists():
                     st.image(bgr2rgb(cv2.imread(str(latest_diffx2))), caption="差分（大枠クラスタ）", use_container_width=True)
-                with grid[2]:
+            with grid[2]:
+                if latest_mask and latest_mask.exists():
                     st.image(cv2.imread(str(latest_mask), cv2.IMREAD_GRAYSCALE), clamp=True, caption="差分マスク", use_container_width=True)
-                # Target overlay toggle
-                if ss.config.get("targets"):
-                    show_tov = st.checkbox("🎯 色ターゲットオーバーレイを表示", value=False, key="k_show_tov")
-                    if show_tov and 'res' in locals() and isinstance(res.get("target_overlay"), np.ndarray):
-                        st.image(bgr2rgb(res["target_overlay"]), caption="色ターゲットオーバーレイ（今回）", use_container_width=True)
+
+            if latest_yolo and latest_yolo.exists():
+                st.image(bgr2rgb(cv2.imread(str(latest_yolo))), caption="YOLO物体検出", use_container_width=True)
+
+            # 色ターゲット結果の可視化（直近ショットの結果を常時表示）
+            with st.expander("🎯 色ターゲットの結果", expanded=False):
+                tr = ss.get("last_target_results", [])
+                if tr:
+                    try:
+                        import pandas as pd
+                        rows = []
+                        for t in tr:
+                            if "error" in t:
+                                rows.append({
+                                    "name": t.get("name","target"),
+                                    "error": t["error"]
+                                })
+                            else:
+                                rows.append({
+                                    "name": t.get("name","target"),
+                                    "dir": t.get("direction"),
+                                    "base(%)": round(t.get("base_ratio",0)*100, 2),
+                                    "curr(%)": round(t.get("curr_ratio",0)*100, 2),
+                                    "delta(%)": round(t.get("delta",0)*100, 2),
+                                    "alert": bool(t.get("alert", False)),
+                                    "vanished": bool(t.get("vanished", False)),
+                                })
+                        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                    except Exception:
+                        for t in tr:
+                            if "error" in t:
+                                st.error(f"[{t.get('name','target')}] error: {t['error']}")
+                            else:
+                                st.write(
+                                    f"- **{t.get('name','target')}** "
+                                    f"(基準 {t.get('base_ratio',0)*100:.2f}% → 現在 {t.get('curr_ratio',0)*100:.2f}%, "
+                                    f"Δ {t.get('delta',0)*100:.2f}%, dir={t.get('direction')}) "
+                                    f"{'⚠️ alert' if t.get('alert') else ''} "
+                                    f"{'❌ vanished' if t.get('vanished') else ''}"
+                                )
+                else:
+                    st.caption("直近ショットの結果がまだありません。（①や②でターゲット追加→③でスタートしてください）")
 
         lm = ss.get("last_metrics") or {}
-        info.info(f"整列: {lm.get('aligned','-')} / SSIM: {('-' if lm.get('ssim') in (None,-1) else f'{lm.get('ssim'):.4f}')} / 差分率: {lm.get('diff_ratio','-') if isinstance(lm.get('diff_ratio'),str) else f'{(lm.get('diff_ratio') or 0)*100:.2f}%'} / ボックス数: {lm.get('boxes','-')}")
-
-        # 色ターゲットのライブ状態
-        if ss.config.get("targets"):
-            st.markdown("---")
-            st.markdown("#### 🎯 色ターゲットの状態")
-            latest_res_targets = res.get("target_results") if 'res' in locals() else None
-            # 直近の結果が無い場合は最新キャプチャから再計算
-            if latest_res_targets is None and latest_cap:
-                tmp_imgB = cv2.imread(latest_cap, cv2.IMREAD_COLOR)
-                tmp_cmp = compare_to_baseline(baseline, tmp_imgB, ss.config)
-                latest_res_targets = tmp_cmp.get("target_results")
-            if latest_res_targets:
-                for tr in latest_res_targets:
-                    if tr.get("error"):
-                        st.warning(f"{tr['name']}: {tr['error']}")
-                        continue
-                    badge = "🛎️" if tr.get("alert") else "✅"
-                    st.write(f"{badge} **{tr['name']}**  現在: {tr['curr_ratio']*100:.2f}%  (基準 {tr['base_ratio']*100:.2f}% / Δ {tr['delta']*100:.2f}% / 条件 {tr['direction']} {tr['threshold_pct']}%)")
-            else:
-                st.caption("まだデータがありません。撮影待ちです。")
-            # Compact visualization for current masks
-            if latest_res_targets and ss.config.get("targets"):
-                st.caption("現在のターゲットマスクの概観")
-                # recompute masks for the latest capture for preview
-                imgB_now = cv2.imread(latest_cap, cv2.IMREAD_COLOR) if latest_cap else None
-                if imgB_now is not None:
-                    try:
-                        tmp_cmp = compare_to_baseline(baseline, imgB_now, ss.config)
-                        st.image(bgr2rgb(tmp_cmp["target_overlay"]), caption="色ターゲットオーバーレイ（最新）", use_container_width=True)
-                    except Exception:
-                        pass
+        info.info(
+            f"整列: {lm.get('aligned','-')} / "
+            f"SSIM: {('-' if lm.get('ssim') in (None,-1) else f'{lm.get('ssim'):.4f}')} / "
+            f"差分率: {lm.get('diff_ratio','-') if isinstance(lm.get('diff_ratio'),str) else f'{(lm.get('diff_ratio') or 0)*100:.2f}%'} / "
+            f"ボックス数: {lm.get('boxes','-')}"
+        )
 
     # 履歴ギャラリー
     st.markdown("---")
@@ -752,19 +870,20 @@ def ui_step_run():
         with cols[i % ncols]:
             ts = Path(cp).stem
             dp = Path(ss.session_dir)/"diffs"/f"{ts}_diff.png"
+            dpx2 = Path(ss.session_dir)/"diffs"/f"{ts}_diffx2.png"
+            yp = Path(ss.session_dir)/"diffs"/f"{ts}_yolo.png"
             st.image(bgr2rgb(cv2.imread(cp)), caption=ts, use_container_width=True)
-            if dp.exists():
-                with st.expander("差分を表示"):
+            with st.expander("差分/YOLOを表示"):
+                if dp.exists():
                     st.image(bgr2rgb(cv2.imread(str(dp))), caption="差分（赤枠・小）", use_container_width=True)
-                    dpx2 = Path(ss.session_dir)/"diffs"/f"{ts}_diffx2.png"
-                    if dpx2.exists():
-                        st.image(bgr2rgb(cv2.imread(str(dpx2))), caption="差分（大枠クラスタ）", use_container_width=True)
+                if dpx2.exists():
+                    st.image(bgr2rgb(cv2.imread(str(dpx2))), caption="差分（大枠クラスタ）", use_container_width=True)
+                if yp.exists():
+                    st.image(bgr2rgb(cv2.imread(str(yp))), caption="YOLO物体検出", use_container_width=True)
 
 # ============ UI: テストモード ============ 
 def ui_mode_test():
     st.header("📦 テストモード（バッチで画像ペアを比較）")
-
-    # 1) 入力画像の場所
     colA, colB = st.columns([2,1])
     with colA:
         st.markdown("**画像ディレクトリ**")
@@ -780,7 +899,6 @@ def ui_mode_test():
 
     with colB:
         st.markdown("**クイック追加（よく使う組み合わせ）**")
-        # 既知のデフォルトペアがある場合は提案
         candidates = []
         def has(name): return any(Path(p).name == name for p in paths)
         if has("closedoor.png") and has("opendoor.png"):
@@ -791,7 +909,6 @@ def ui_mode_test():
             candidates.append(("easy.png","easy_wrong.png"))
         if has("IMG_4726.PNG") and has("IMG_4728.PNG"):
             candidates.append(("IMG_4726.PNG","IMG_4728.PNG"))
-
         if candidates:
             for a,b in candidates:
                 if st.button(f"＋ 追加: {a} vs {b}", use_container_width=True):
@@ -803,7 +920,6 @@ def ui_mode_test():
         else:
             st.caption("既知の組み合わせ候補は見つかりませんでした。")
 
-    # 2) 手動でペア追加
     st.markdown("---")
     st.markdown("**手動でペアを追加**")
     c1, c2, c3 = st.columns([5,5,2])
@@ -819,30 +935,6 @@ def ui_mode_test():
                 st.toast("ペアを追加しました")
                 st.rerun()
 
-    # 3) 現在のペア一覧
-    st.markdown("---")
-    st.subheader("📄 実行キュー")
-    if not ss.test_pairs:
-        st.info("ペアがありません。上のボタンから追加してください。")
-    else:
-        # 表示 & 削除ボタン
-        rm_idxs = []
-        for i, (pa, pb) in enumerate(ss.test_pairs):
-            cols = st.columns([5,5,1,1])
-            cols[0].markdown(f"**A**: `{pa}`")
-            cols[1].markdown(f"**B**: `{pb}`")
-            if cols[2].button("👀 プレビュー", key=f"pv{i}"):
-                colp = st.columns(2)
-                with colp[0]:
-                    st.image(bgr2rgb(cv2.imread(pa)), caption="A", use_container_width=True)
-                with colp[1]:
-                    st.image(bgr2rgb(cv2.imread(pb)), caption="B", use_container_width=True)
-            if cols[3].button("🗑️", key=f"rm{i}"):
-                rm_idxs.append(i)
-        for idx in reversed(rm_idxs):
-            ss.test_pairs.pop(idx)
-
-    # 4) 設定（検出パラメータ）
     st.markdown("---")
     st.subheader("⚙️ 設定（テスト用）")
     cfg = {
@@ -851,9 +943,10 @@ def ui_mode_test():
         "align_mode": st.selectbox("整列モード", ["AUTO","ECC","H","OFF"], index=0, key="t_align"),
         "shift_px_thresh": st.slider("ズレ判定しきい値(px)", 1.0, 20.0, 6.0, 0.5, key="t_shift"),
         "min_wh": st.slider("最小ボックス幅/高さ(px)", 5, 100, 15, 1, key="t_minwh"),
+        # YOLO（テスト時も可視化）
+        "yolo_conf": st.slider("YOLO信頼度しきい値", 0.1, 0.9, float(ss.get("yolo_conf",0.5)), 0.05, key="t_yconf")
     }
 
-    # 5) 実行
     st.markdown("---")
     run_col1, run_col2 = st.columns([1,4])
     out_root = Path("artifacts_gui") / datetime.now().strftime("%Y-%m-%d_%H%M%S")
@@ -867,7 +960,6 @@ def ui_mode_test():
         st.session_state["test_out_root"] = str(out_root)
         st.success("テスト実行が完了しました。下に結果が表示されます。")
 
-    # 6) 結果表示
     res = st.session_state.get("test_results")
     if res:
         st.subheader("📊 テスト結果")
@@ -891,7 +983,6 @@ def ui_mode_test():
                 st.image(cv2.imread(str(case_dir/"diff_mask.png"), cv2.IMREAD_GRAYSCALE), clamp=True, caption="差分マスク", use_container_width=True)
             ssim_txt = "-" if r["ssim"] in (None, -1) else f"{r['ssim']:.4f}"
             st.caption(f"整列: {r['aligned']} / SSIM: {ssim_txt} / 差分率: {r['diff_ratio']*100:.2f}% / ボックス数: {r['boxes']}")
-        # ZIP
         with st.expander("📦 成果物"):
             st.code(st.session_state.get("test_out_root",""))
 
@@ -899,9 +990,7 @@ def ui_mode_test():
 def main():
     st.caption(f"Auto-refresh: {_AUTOREFRESH_IMPL}  •  セッション: `{ss.session_dir or '未作成'}`")
     if ss.mode == "テスト":
-        ui_mode_test()
-        return
-    # 以降は監視モード
+        ui_mode_test(); return
     phase = ss.get("phase","INIT")
     if phase == "INIT":
         ui_step_baseline()
@@ -915,8 +1004,7 @@ def main():
         ui_step_run()
     else:
         st.warning("未知の状態です。初期化します。")
-        _init_state()
-        ui_step_baseline()
+        _init_state(); ui_step_baseline()
 
 if __name__ == "__main__":
     main()
