@@ -1,13 +1,14 @@
 # -------- 基本設定 --------
 PYTHON ?= .venv/bin/python
 PIP    ?= .venv/bin/pip
-SCRIPT ?= make_ref.py
+# 実行するスクリプトをYOLO差分検知用に変更
+SCRIPT ?= run_yolo_diff.py
 STREAMLIT ?= .venv/bin/streamlit
 APP       ?= app.py
 HOST      ?= 127.0.0.1
 PORT      ?= 8501
 
-OUTDIR := results          # make_ref.py の出力先
+OUTDIR := results          # スクリプトの出力先
 ARTIFACT := artifacts      # ケースごとの成果物保存先
 
 # A:B 形式で列挙（コロンで区切る）
@@ -23,13 +24,14 @@ help:
 	@echo "make test-all        # 全テスト実行（artifacts/<case>/ に保存）"
 	@echo "make run A=img1 B=img2  # 任意ペアを一回実行"
 	@echo "make clean           # 生成物削除"
+	@echo "make app             # Streamlit UIを起動"
 
 venv:
 	@test -d .venv || python3 -m venv .venv
 
 deps: venv
 	$(PIP) install --upgrade pip
-	$(PIP) install opencv-python scikit-image numpy streamlit streamlit-autorefresh
+	$(PIP) install opencv-python scikit-image numpy streamlit streamlit-autorefresh ultralytics torch
 
 # 任意ペアを一回実行: 例) make run A=test1a.png B=test1b.png
 run: venv
@@ -37,12 +39,13 @@ run: venv
 		echo "Usage: make run A=<imgA> B=<imgB>"; exit 1; \
 	fi
 	@name="$${A%.*}_vs_$${B%.*}"; \
-	echo "==> $$name"; \
-	rm -rf $(OUTDIR); mkdir -p $(OUTDIR); \
-	printf '%s\n' n | $(PYTHON) $(SCRIPT) "$(A)" "$(B)"; \
-	mkdir -p "$(ARTIFACT)/$$name"; \
-	if ls $(OUTDIR)/* >/dev/null 2>&1; then mv $(OUTDIR)/* "$(ARTIFACT)/$$name/"; fi; \
-	echo "saved to $(ARTIFACT)/$$name"
+	@safename="$${name//\//_}"; \
+	echo "==> $$safename"; \
+	rm -rf $(OUTDIR); \
+	$(PYTHON) $(SCRIPT) "$(A)" "$(B)"; \
+	mkdir -p "$(ARTIFACT)"; \
+	mv "$(OUTDIR)" "$(ARTIFACT)/$$safename"; \
+	echo "saved to $(ARTIFACT)/$$safename"
 
 # すべてのペアを順に実行
 test-all: venv
@@ -50,11 +53,11 @@ test-all: venv
 	@for P in $(PAIRS); do \
 		A="$${P%%:*}"; B="$${P##*:}"; \
 		name="$${A%.*}_vs_$${B%.*}"; \
-		echo "==> $$name"; \
-		rm -rf $(OUTDIR); mkdir -p $(OUTDIR); \
-		printf '%s\n' n | $(PYTHON) $(SCRIPT) "$$A" "$$B"; \
-		mkdir -p "$(ARTIFACT)/$$name"; \
-		if ls $(OUTDIR)/* >/dev/null 2>&1; then mv $(OUTDIR)/* "$(ARTIFACT)/$$name/"; fi; \
+		safename="$${name//\//_}"; \
+		echo "==> $$safename"; \
+		rm -rf $(OUTDIR); \
+		$(PYTHON) $(SCRIPT) "$$A" "$$B"; \
+		mv "$(OUTDIR)" "$(ARTIFACT)/$$safename"; \
 	done
 	@echo "All artifacts -> $(ARTIFACT)/<case>/"
 
