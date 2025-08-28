@@ -1,1 +1,6 @@
 results
+*pyc
+*png
+config.json
+index.csv
+*json
