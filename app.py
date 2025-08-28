@@ -156,7 +156,11 @@ def render_color_target_editor():
         name = st.text_input("名前", value=f"target_{len(ss.targets)+1}", key="t_name")
         direction = st.selectbox("アラート条件", ["decrease", "increase"], help="decrease: 減ったら警告 / increase: 増えたら警告", key="t_dir")
         threshold_pct = st.slider("変化しきい値(%)", 1, 50, 10, key="t_thr")
+        # ▼ ヘルプ（色ターゲット：変化しきい値）
+        _help_expander(*_HELP_MD["color_threshold"])
         k_sigma = st.slider("色ゆるさ kσ", 1.0, 4.0, 2.5, 0.1, key="t_ks")
+        # ▼ ヘルプ（色ターゲット：kσ）
+        _help_expander(*_HELP_MD["color_k_sigma"])
         use_l = st.checkbox("明度Lも使う", value=False, help="色味メインで十分ならOFF推奨", key="t_useL")
         roi_enable = st.checkbox("ROIを指定する", value=False, key="t_roi_en")
         roi = None
@@ -302,6 +306,69 @@ def capture_frame(index: int, backend: str, warmup: int = 5, size: Tuple[int,int
 
 def bgr2rgb(img: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+# ===== ヘルプ（expander方式）共通UI =====
+def _help_expander(title: str, body_md: str, default_open: bool = False):
+    """ラベル直下に展開できる説明ブロックを出す。"""
+    with st.expander("❓ " + title, expanded=default_open):
+        st.markdown(body_md)
+
+_HELP_MD = {
+    "min_wh": (
+        "最小ボックス幅/高さ（px）＝ min_wh",
+        """
+- 差分から作る小ボックスの最小サイズ。これ未満はノイズとして捨てる。
+- 大きくすると: ノイズ減るが細かい変化を見落とす。
+- 小さくすると: 細かい変化も拾うがノイズも増える。
+- 目安: **15 px**。
+"""
+    ),
+    "yolo_conf": (
+        "YOLO信頼度しきい値 ＝ yolo_conf",
+        """
+- YOLOv8 の検出信頼度の下限。
+- 高くすると: 誤検出減るが見落とし増える。
+- 低くすると: 見落とし減るが誤検出増える。
+- 目安: **0.5**。
+"""
+    ),
+    "target_short": (
+        "共通ダウンサンプル短辺（px）＝ target_short",
+        """
+- 基準と現在フレームの短辺をこのピクセル数に揃えてから全処理を行う（解像度統一）。
+- 大きくすると: 細部まで見えるが重くなり、ノイズも拾いやすい。
+- 小さくすると: 軽くなるが細かい変化は消えやすい。
+- 目安: **720 前後**。
+"""
+    ),
+    "shift_px_thresh": (
+        "ズレ判定しきい値（px）＝ shift_px_thresh",
+        """
+- カメラ位置のズレ量がこのピクセルを超えると「ズレあり」と判定 → 自動整列を試みる。
+- 小さくすると: わずかなズレでも整列（敏感）。
+- 大きくすると: 軽微なズレは無視（安定）。
+- 目安: **6 px**。
+"""
+    ),
+    "color_threshold": (
+        "変化しきい値(%)（色ターゲット）",
+        """
+- ターゲット色の画素比が基準からどれくらい増減したらアラートを出すか。
+- 大きくすると: 鈍感（大きな変化でのみ警告）。
+- 小さくすると: 敏感（小さな変化ですぐ警告）。
+- 目安: **10〜20%**。
+"""
+    ),
+    "color_k_sigma": (
+        "色ゆるさ kσ（色ターゲット）",
+        """
+- Lab色空間での「基準色の平均±k×標準偏差」を色領域として採用。
+- 大きくすると: 色のブレに強いが似た色も拾いやすい。
+- 小さくすると: 厳密に色を見られるが少しの変化で見失いやすい。
+- 目安: **2.0〜2.5**。
+"""
+    ),
+}
 
 # ======= Beep/Alert Helpers =======
 def _play_beep(duration_ms: int = 500, freq_hz: int = 880):
@@ -612,16 +679,24 @@ def ui_step_config():
         st.markdown("**撮影**")
         interval = st.slider("撮影間隔（秒）⏱️", 10, 600, 60, 5)
         target_short = st.slider("共通ダウンサンプル短辺（px）", 360, 1440, 720, 60)
+        # ▼ ヘルプ（target_short）
+        _help_expander(*_HELP_MD["target_short"])
 
         st.markdown("---")
         st.markdown("**整列と検出**")
         align_mode = st.selectbox("整列モード", ["AUTO","ECC","H","OFF"], help="AUTO推奨")
         shift_thresh = st.slider("ズレ判定しきい値(px)", 1.0, 20.0, 6.0, 0.5)
+        # ▼ ヘルプ（shift_px_thresh）
+        _help_expander(*_HELP_MD["shift_px_thresh"])
         min_wh = st.slider("最小ボックス幅/高さ(px)", 5, 100, 15, 1)
+        # ▼ ヘルプ（min_wh）
+        _help_expander(*_HELP_MD["min_wh"])
 
         st.markdown("---")
         st.markdown("**YOLO（物体監視）**")
         yolo_conf = st.slider("YOLO信頼度しきい値", 0.1, 0.9, float(ss.get("yolo_conf",0.5)), 0.05)
+        # ▼ ヘルプ（yolo_conf）
+        _help_expander(*_HELP_MD["yolo_conf"])
         watch_person = st.toggle("人の出現を監視（基準に居なかったのに現れたら通知）", value=bool(ss.get("yolo_watch_person", True)))
         alert_new = st.toggle("基準にないラベルが現れたら通知", value=bool(ss.get("yolo_alert_new", True)))
         alert_missing = st.toggle("基準にあったラベルが消えたら通知", value=bool(ss.get("yolo_alert_missing", True)))
@@ -946,6 +1021,11 @@ def ui_mode_test():
         # YOLO（テスト時も可視化）
         "yolo_conf": st.slider("YOLO信頼度しきい値", 0.1, 0.9, float(ss.get("yolo_conf",0.5)), 0.05, key="t_yconf")
     }
+    # ▼ テスト設定のヘルプ
+    _help_expander(*_HELP_MD["target_short"])
+    _help_expander(*_HELP_MD["shift_px_thresh"])
+    _help_expander(*_HELP_MD["min_wh"])
+    _help_expander(*_HELP_MD["yolo_conf"])
 
     st.markdown("---")
     run_col1, run_col2 = st.columns([1,4])
