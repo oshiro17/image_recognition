@@ -2,6 +2,7 @@
 import cv2, numpy as np
 import streamlit as st
 from services.camera import bgr2rgb
+from ui.help import help_expander_if
 
 # クリックピック対応（無ければフォールバック）
 try:
@@ -109,8 +110,10 @@ def render_color_target_editor(ss):
     with cols[1]:
         name = st.text_input("名前", value=f"target_{len(ss.targets)+1}", key="t_name")
         direction = st.selectbox("アラート条件", ["decrease", "increase"], help="decrease: 減ったら警告 / increase: 増えたら警告", key="t_dir")
-        threshold_pct = st.slider("変化しきい値(%)", 1, 50, 10, key="t_thr")
+        threshold_pct = st.slider("変化しきい値(%)", 0, 100, 10, key="t_thr")
+        help_expander_if("color_threshold")
         k_sigma = st.slider("色ゆるさ kσ", 1.0, 4.0, 2.5, 0.1, key="t_ks")
+        help_expander_if("color_k_sigma")
         use_l = st.checkbox("明度Lも使う", value=False, help="色味メインで十分ならOFF推奨", key="t_useL")
         roi_enable = st.checkbox("ROIを指定する", value=False, key="t_roi_en")
         roi = None

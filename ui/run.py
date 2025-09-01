@@ -7,6 +7,7 @@ from services.camera import bgr2rgb, capture_frame
 from services.io import append_index, make_zip
 from services.alerts import alert_banner
 from logic.compare import compare_to_baseline
+from ui.help import help_expander_if
 
 # 自動リロード（パッケージが無ければJSでフォールバック）
 try:
@@ -26,6 +27,7 @@ def imread_color(path: str):
 
 def ui_step_run(ss):
     st.header("③ 監視スタート")
+    help_expander_if("run_step")
     colA, colB = st.columns([2,1])
 
     with colB:
@@ -118,6 +120,7 @@ def ui_step_run(ss):
                 })
                 ss.last_metrics = {"ts": tsname, "aligned": res["aligned"], "ssim": res["ssim"], "diff_ratio": res["diff_ratio"], "boxes": len(res["boxes"])}
                 ss.last_target_results = res.get("target_results", [])
+                ss.last_yolo_changes = res.get("yolo_changes", {})
 
                 # アラートまとめ
                 msgs = []
@@ -128,6 +131,21 @@ def ui_step_run(ss):
                     msgs.append("新しい物体: " + ", ".join(yc["new_labels"]))
                 if ss.config.get("yolo_alert_missing", True) and yc.get("missing_labels"):
                     msgs.append("消えた物体: " + ", ".join(yc["missing_labels"]))
+                # YOLO: 面積変化/移動量のアラート
+                for a in (yc.get("area_alerts") or []):
+                    try:
+                        lbl = a.get("label", "obj")
+                        dp = float(a.get("delta_pct", 0))
+                        msgs.append(f"{lbl} のサイズ変化 {dp:+.1f}% (基準 {a.get('base_area',0):.0f} → 現在 {a.get('curr_area',0):.0f})")
+                    except Exception:
+                        pass
+                for m in (yc.get("moved_alerts") or []):
+                    try:
+                        lbl = m.get("label", "obj")
+                        shift = float(m.get("shift_px", 0))
+                        msgs.append(f"{lbl} が移動しました (≈ {shift:.1f}px)")
+                    except Exception:
+                        pass
                 for t in (res.get("target_results", []) or []):
                     if t.get("alert"):
                         direction_jp = "増加" if t.get("direction") == "increase" else "減少"
@@ -175,6 +193,36 @@ def ui_step_run(ss):
 
             if latest_yolo and latest_yolo.exists():
                 st.image(bgr2rgb(cv2.imread(str(latest_yolo))), caption="YOLO物体検出", use_container_width=True)
+
+            # YOLO変化の要約テーブル
+            with st.expander("🧠 YOLO 変化ログ", expanded=False):
+                yc_last = ss.get("last_yolo_changes") or {}
+                try:
+                    import pandas as pd
+                    rows = []
+                    for a in (yc_last.get("area_alerts") or []):
+                        rows.append({
+                            "type": "area",
+                            "label": a.get("label"),
+                            "delta(%)": round(float(a.get("delta_pct", 0)), 1),
+                            "base_area": int(a.get("base_area", 0)),
+                            "curr_area": int(a.get("curr_area", 0)),
+                        })
+                    for m in (yc_last.get("moved_alerts") or []):
+                        rows.append({
+                            "type": "move",
+                            "label": m.get("label"),
+                            "shift_px": round(float(m.get("shift_px", 0)), 1),
+                        })
+                    if rows:
+                        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                    else:
+                        st.caption("しきい値を超えるYOLO変化はありませんでした。")
+                except Exception:
+                    for a in (yc_last.get("area_alerts") or []):
+                        st.write(f"• [area] {a.get('label','obj')} Δ {a.get('delta_pct',0):.1f}% (基準 {a.get('base_area',0)} → 現在 {a.get('curr_area',0)})")
+                    for m in (yc_last.get("moved_alerts") or []):
+                        st.write(f"• [move] {m.get('label','obj')} shift ≈ {m.get('shift_px',0):.1f}px")
 
             with st.expander("🎯 色ターゲットの結果", expanded=False):
                 tr = ss.get("last_target_results", [])

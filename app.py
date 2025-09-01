@@ -906,7 +906,7 @@ def ui_step_run():
                             f"(基準 {t.get('base_ratio',0)*100:.1f}% → 現在 {t.get('curr_ratio',0)*100:.1f}%)"
                         )
                     if t.get("vanished"):
-                        msgs.append(f"色[{t.get('name','target')}] 完全に消失しました")
+                        msgs.append(f"色[{t.get('name','target')}] の物体に異常がありました")
                 if msgs:
                     _alert_banner(" / ".join(msgs))
 

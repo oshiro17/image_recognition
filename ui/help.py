@@ -1,12 +1,59 @@
 # ui/help.py
+# -*- coding: utf-8 -*-
 import streamlit as st
 
+__all__ = ["help_expander", "help_expander_if", "HELP_MD"]
+
 def help_expander(title: str, body_md: str, default_open: bool = False):
-    """ラベル直下などに置ける展開式のヘルプボックス。"""
+    """基本のヘルプ表示"""
     with st.expander("❓ " + title, expanded=default_open):
         st.markdown(body_md)
 
+def help_expander_if(arg1, body_md: str | None = None, default_open: bool = False):
+    """
+    いずれの呼び方にも対応:
+      - help_expander_if("min_wh")                          ← キーだけ
+      - help_expander_if(*HELP_MD["min_wh"])                ← タプル展開
+      - help_expander_if("タイトル", "本文", default_open)    ← 直接指定
+
+    ※ キー文字列が HELP_MD に無い場合は何も表示せず黙って return します（落ちません）
+    """
+    # ① キーだけ渡された場合
+    if body_md is None and isinstance(arg1, str):
+        # キーが登録されていれば表示、無ければ何もしない（安全）
+        pair = HELP_MD.get(arg1)
+        if pair:
+            title, body = pair
+            return help_expander(title, body, default_open)
+        return  # 未登録キーは無視して終了
+
+    # ② タイトル＋本文（互換）
+    if body_md is not None:
+        return help_expander(arg1, body_md, default_open)
+
+    # ③ 想定外の形
+    return  # 何もしない（落とさない）
+
+# 共通ヘルプ本文
 HELP_MD = {
+    "baseline_step": (
+        "ステップ①：基準を撮影/読み込み",
+        """
+- 監視の基準となる1枚をカメラ撮影 or 画像アップロードで確定します。
+- 基準確定後、この基準に対して「現在フレーム」を定期取得し差分を見ます。
+- 基準確定時に YOLO 物体検出を実行し、検出リストを保存します。
+"""
+    ),
+    "camera_backend": (
+        "カメラのバックエンド選択",
+        """
+- **AUTO**: まず自動で開きに行きます。ダメなら他の方式を試してください。
+- **AVFOUNDATION / QT**: macOS のカメラ向け。M1/M2/M3環境は **AVFOUNDATION** が安定しやすいです。
+- **V4L2**: Linux の一般的なWebカメラインターフェース。
+- **DSHOW**: Windows の古い DirectShow 経由。
+- 起動できない/緑画面/真っ黒などは **デバイス番号** と **バックエンド** を切り替えて再試行してください。
+"""
+    ),
     "min_wh": (
         "最小ボックス幅/高さ（px）＝ min_wh",
         """

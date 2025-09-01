@@ -6,14 +6,17 @@ from pathlib import Path
 from services.camera import bgr2rgb, capture_frame
 from services.io import new_session_dir
 from ui.color_target_editor import render_color_target_editor
+from ui.help import help_expander_if, HELP_MD
 from core.yolo import detect_objects, draw_detections
 
 def ui_step_baseline(ss):
     st.header("① 基準を撮影 / 読み込み")
+    help_expander_if("baseline_step")
     colL, colR = st.columns(2)
 
     with colL:
         st.markdown("#### 📸 カメラで撮影")
+        help_expander_if("camera_backend")
         idx = st.number_input("カメラデバイス番号", 0, 10, ss.get("cam_index",0), 1, key="k_cam_index")
 
         # ✅ 内部APIを使わず、標準のsys.platformで判定

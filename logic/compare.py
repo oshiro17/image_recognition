@@ -3,6 +3,35 @@ from typing import Dict, Any, Optional, List
 import numpy as np
 import cv2
 
+# --- YOLO位置合わせ＆物体内差分 用ヘルパ ---
+def _iou_xywh(a, b):
+    ax, ay, aw, ah = a; bx, by, bw, bh = b
+    ax2, ay2 = ax+aw, ay+ah; bx2, by2 = bx+bw, by+bh
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2-ix1), max(0, iy2-iy1)
+    inter = iw*ih
+    union = aw*ah + bw*bh - inter
+    return float(inter) / float(max(1, union))
+
+def _crop(img, box):
+    x,y,w,h = map(int, box)
+    h_img, w_img = img.shape[:2]
+    x = max(0, min(x, w_img-1))
+    y = max(0, min(y, h_img-1))
+    w = max(1, min(w, w_img-x))
+    h = max(1, min(h, h_img-y))
+    return img[y:y+h, x:x+w]
+
+def _object_diff_ratio(a_roi, b_roi, min_wh=15):
+    if a_roi.size == 0 or b_roi.size == 0:
+        return 0.0
+    # サイズ合わせ
+    a_roi, b_roi = ensure_same_size(a_roi, b_roi)
+    # 軽量な差分マスクで割合算出
+    _, mask, _ = difference_boxes(a_roi, b_roi, min_wh=min_wh, bin_thresh=None)
+    return float((mask > 0).sum()) / float(mask.size)
+
 from core.io_utils import ensure_same_size
 from core.align import camera_misaligned, align_ecc, align_homography
 from core.vis import make_boxes_overlay_transparent, draw_clusters_only
@@ -40,6 +69,8 @@ def compare_to_baseline(baseline_bgr: np.ndarray, current_bgr: np.ndarray, cfg: 
         th_mask = fused_diff_mask(a, b)
         vis_boxes, boxes = boxes_from_mask(a, th_mask, min_wh=cfg.get("min_wh", 15))
 
+    overlay = make_boxes_overlay_transparent(a, b, boxes, alpha=0.5, draw_border=True) if boxes else a.copy()
+
     diff_ratio = float((th_mask>0).sum()) / float(th_mask.size)
     clusters = cluster_dense_boxes(boxes, a.shape, dilate_iter=3, min_count=6, min_wh=30)
     clusters_vis = draw_clusters_only(a, clusters, color=(0,0,255), thickness=6, show_count=True)
@@ -53,24 +84,36 @@ def compare_to_baseline(baseline_bgr: np.ndarray, current_bgr: np.ndarray, cfg: 
 
     # 色ターゲット監視（cfg["targets"] は UI 側で生成）
     target_results = []
+    # 消滅判定のしきい: 相対(基準比)と絶対(画素比)
+    vanish_rel = float(cfg.get("target_vanish_rel", 0.10))   # 基準比10%未満で消滅
+    vanish_abs = float(cfg.get("target_vanish_abs", 0.0005)) # 絶対0.05%未満で消滅
+
     for t in (cfg.get("targets", []) or []):
         try:
+            # A/B ともに同じ前処理後の画像で比率を計算
+            base_ratio_runtime = _ratio_for_target(a, t)
             curr_ratio = _ratio_for_target(b, t)
-            base_ratio = float(t.get("base_ratio", 0.0))
+
             direction = t.get("direction", "decrease")
             thr = float(t.get("threshold_pct", 5.0)) / 100.0
-            delta = curr_ratio - base_ratio
+            delta = curr_ratio - base_ratio_runtime
+
             if direction == "increase":
-                alert = (delta >= thr); vanished = False
-            else:
-                alert = (-delta >= thr); vanished = (curr_ratio <= 0.001)
+                alert = (delta >= thr)
+            else:  # decrease
+                alert = (-delta >= thr)
+
+            # 消滅判定（相対/絶対の大きい方を採用）
+            vanish_gate = max(vanish_abs, base_ratio_runtime * vanish_rel)
+            vanished = (curr_ratio <= vanish_gate)
+
             target_results.append({
                 "name": t.get("name", "target"),
-                "curr_ratio": curr_ratio,
-                "base_ratio": base_ratio,
-                "delta": delta,
+                "curr_ratio": float(curr_ratio),
+                "base_ratio": float(base_ratio_runtime),
+                "delta": float(delta),
                 "direction": direction,
-                "threshold_pct": t.get("threshold_pct", 5.0),
+                "threshold_pct": float(t.get("threshold_pct", 5.0)),
                 "alert": bool(alert),
                 "vanished": bool(vanished)
             })
@@ -83,13 +126,53 @@ def compare_to_baseline(baseline_bgr: np.ndarray, current_bgr: np.ndarray, cfg: 
     yolo_vis = draw_detections(b, det_cur)
     yolo_changes = analyze_yolo_changes(baseline_yolo or [], det_cur, iou_thr=0.3)
 
+    # --- 物体単位の差分判定（基準の位置情報を活用） ---
+    iou_thr = float(cfg.get("yolo_iou_thr", 0.30))
+    obj_diff_thr = float(cfg.get("yolo_obj_diff_thr_pct", 15.0)) / 100.0
+    min_wh_local = int(cfg.get("min_wh", 15))
+
+    yolo_obj_changes = []  # [{label, base_bbox, cur_bbox, iou, diff_ratio, changed}]
+    for bd in (baseline_yolo or []):
+        blabel = bd.get("label") or bd.get("name") or bd.get("class")
+        bb = bd.get("bbox") or bd.get("xywh")
+        if blabel is None or bb is None:
+            continue
+        # 最良マッチ（同ラベルかつ最大IoU）を探す
+        best = None; best_iou = 0.0
+        for cd in det_cur:
+            clabel = cd.get("label") or cd.get("name") or cd.get("class")
+            cb = cd.get("bbox") or cd.get("xywh")
+            if clabel != blabel or cb is None:
+                continue
+            iou = _iou_xywh(tuple(bb), tuple(cb))
+            if iou > best_iou:
+                best_iou, best = iou, cd
+        if best is None or best_iou < iou_thr:
+            # 消失は yolo_changes 側で扱うためここではスキップ
+            continue
+
+        # BBox領域内だけで差分率を計算
+        a_roi = _crop(a, bb)
+        b_roi = _crop(b, best.get("bbox") or best.get("xywh"))
+        ratio = _object_diff_ratio(a_roi, b_roi, min_wh=min_wh_local)
+        yolo_obj_changes.append({
+            "label": blabel,
+            "base_bbox": tuple(map(float, bb)),
+            "cur_bbox": tuple(map(float, best.get("bbox") or best.get("xywh"))),
+            "iou": float(best_iou),
+            "diff_ratio": float(ratio),
+            "changed": bool(ratio >= obj_diff_thr),
+        })
+
     return {
         "A": a, "B": b,
         "vis_boxes": vis_boxes, "mask": th_mask, "clusters_vis": clusters_vis,
         "boxes": boxes, "diff_ratio": diff_ratio, "ssim": ss_val,
         "aligned": aligned_method,
         "target_results": target_results,
-        "yolo_detections": det_cur, "yolo_vis": yolo_vis, "yolo_changes": yolo_changes
+        "yolo_detections": det_cur, "yolo_vis": yolo_vis, "yolo_changes": yolo_changes,
+        "overlay": overlay,
+        "yolo_obj_changes": yolo_obj_changes,
     }
 
 # ===== 色ターゲット用（UIの定義と一致させる簡易版） =====
