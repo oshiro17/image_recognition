@@ -1,23 +1,13 @@
-# 📷 定期撮影差分 PoC
+https://www.canva.com/design/DAGxUqfcoaQ/8T0qYEK_FNfl3gGQEDShfA/view?utm_content=DAGxUqfcoaQ&utm_campaign=designshare&utm_medium=link2&utm_source=uniquelinks&utlId=h9627a3f685
 
-このプロジェクトはカメラを定期的にキャプチャして直前の画像と比較し、差分を可視化するツールです。  
-[Streamlit](https://streamlit.io/) を使って、ブラウザから操作できます。
+make appで監視機能アプり起動できます。
 
----
+色ターゲット機能
+色をカーソルで指定することで、その色の物体が動いた時、画面から設定のパーセントなくなった時、通知してくれます。
 
-## 🚀 実行方法（まとめてコピー可）
+監視機能
+人が写ってしまった時、ものがなくなった時、ドアが開いた時など、異常を察知し、その記録を残します。
 
-```bash
-# 仮想環境の作成と有効化 (mac/Linux)
-python3 -m venv .venv
-source .venv/bin/activate
-
-# 仮想環境の作成と有効化 (Windows PowerShell)
-python -m venv .venv
-.venv\Scripts\activate
-
-# 必要ライブラリのインストール
-pip install streamlit opencv-python numpy
-
-# アプリ起動
-python -m streamlit run app.py
+テストモード
+差分をしっかり出力できるか、品質のチェックのために使えます。
+ルートのimage-testsの下に置いたpngで実行できます。
